@@ -1,0 +1,164 @@
+<!--
+  navigate_w_replanning_fixed.xml
+  Author  : Ayush Bhandurge
+  Target  : Raspberry Pi 4B  |  Nav2 Jazzy  |  Differential Drive AMR
+
+  v2 — Robustness pass
+  ────────────────────
+  Problem reported: robot "gets confused" as soon as it enters a cell
+  within the inflation radius (non-lethal but costly). DWB's critics
+  score all sampled trajectories poorly there, so FollowPath fails even
+  though the path itself is geometrically fine — clearing the costmap
+  does nothing for that failure mode because the costmap wasn't stale.
+  What actually helps is a small physical repositioning (BackUp / Spin)
+  so DWB gets a fresh pose to sample from.
+
+  BUG FIXED vs the previous version:
+    The old RecoverySequence wrapped everything in <Sequence>. A Sequence
+    does NOT stop just because an inner <Fallback> already succeeded — it
+    keeps ticking every remaining sibling. That meant EVERY recovery
+    cycle cleared the global costmap and re-replanned, even when the
+    cheap bare-replan already worked. Escalation was never actually
+    graduated. Fixed by using <Fallback> as the top-level escalation
+    structure, which genuinely short-circuits on first success.
+
+  Recovery strategy (10 retries, graduated, cheapest-first):
+    Tier 1 : Replan only — no costmap touch, no motion
+    Tier 2 : Clear local costmap + replan
+    Tier 3 : Clear local costmap + Spin in place + replan
+             (repositions heading — helps DWB escape inflation-cost
+              trajectory rejection without needing new space)
+    Tier 4 : Clear local costmap + BackUp + replan
+             (creates physical clearance from the inflated obstacle —
+              this is the tier that most directly targets the reported
+              "stuck near inflation radius" symptom)
+    Tier 5 : Clear local + global costmap + BackUp + Spin + Wait + replan
+             (last resort before the outer RecoveryNode gives up)
+
+  REQUIRES: a `behavior_server` node (package nav2_behaviors) must be
+  running and lifecycle-managed for Spin / BackUp / Wait to work — see
+  the companion nav2_params.yaml behavior_server block and launch file
+  patch. Without it, these action calls will hang waiting for a server
+  that was never started.
+
+  Other changes:
+    - number_of_retries raised from 3 to 10, per request. Because tiers
+      1-2 are cheap and only escalate to motion/global-clear once those
+      fail, 10 retries no longer means 10x full-cost recovery cycles —
+      most retries will resolve at Tier 1 or 2.
+    - RateController at 1 Hz keeps CPU load low on RPi4B (unchanged).
+    - GoalUpdated fallback triggers immediate replan on goal change
+      (unchanged).
+
+  Jazzy compatibility note:
+    RecoveryNode, PipelineSequence, RateController, GoalUpdated,
+    ComputePathToPose, FollowPath, Fallback, Sequence, ClearEntireCostmap,
+    Spin, BackUp, and Wait are all stock Nav2 BT nodes with unchanged
+    XML tags/ports from Iron through Jazzy — no structural Jazzy edits
+    needed here. As before, bt_navigator no longer needs plugin_lib_names
+    to spell these out; they're auto-loaded as of Jazzy.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <!--
+      Outer RecoveryNode: 10 retries.
+      Child 1 (NavigateWithReplanning) runs first.
+      If it FAILS, Child 2 (RecoveryFallback) runs once,
+      then Child 1 is retried. Repeat up to 10 times total.
+    -->
+    <RecoveryNode number_of_retries="10" name="NavigateRecovery">
+      <!-- ═══ MAIN NAVIGATION ═══ -->
+      <PipelineSequence name="NavigateWithReplanning">
+        <!--
+          Rate-limited replanning at 1 Hz.
+          GoalUpdated short-circuits the rate limit:
+          if the goal changes, replan immediately.
+        -->
+        <RateController hz="1.0">
+          <Fallback>
+            <GoalUpdated/>
+            <ComputePathToPose
+              goal="{goal}"
+              path="{path}"
+              planner_id="GridBased"/>
+          </Fallback>
+        </RateController>
+        <!-- Follow the computed path -->
+        <FollowPath
+          path="{path}"
+          controller_id="FollowPath"/>
+      </PipelineSequence>
+
+      <!-- ═══ GRADUATED RECOVERY — Fallback short-circuits on first success ═══ -->
+      <Fallback name="RecoveryFallback">
+
+        <!-- Tier 1: bare replan, no costmap touch, no motion -->
+        <ComputePathToPose
+          goal="{goal}"
+          path="{path}"
+          planner_id="GridBased"/>
+
+        <!-- Tier 2: clear local costmap, then replan -->
+        <Sequence name="ClearLocalAndReplan">
+          <ClearEntireCostmap
+            name="ClearLocalCostmap_T2"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+          <ComputePathToPose
+            goal="{goal}"
+            path="{path}"
+            planner_id="GridBased"/>
+        </Sequence>
+
+        <!-- Tier 3: clear local + Spin in place, then replan.
+             Repositions heading so DWB samples trajectories from a
+             different orientation — targets inflation-cost rejection
+             without needing to physically move away. -->
+        <Sequence name="ClearLocalSpinAndReplan">
+          <ClearEntireCostmap
+            name="ClearLocalCostmap_T3"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+          <Spin spin_dist="0.6" time_allowance="10"/>
+          <ComputePathToPose
+            goal="{goal}"
+            path="{path}"
+            planner_id="GridBased"/>
+        </Sequence>
+
+        <!-- Tier 4: clear local + BackUp, then replan.
+             Creates real physical clearance from the inflated obstacle —
+             the tier that most directly targets "stuck near inflation
+             radius" since it changes the robot's actual footprint
+             position, not just the costmap or heading. -->
+        <Sequence name="ClearLocalBackUpAndReplan">
+          <ClearEntireCostmap
+            name="ClearLocalCostmap_T4"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+          <BackUp backup_dist="0.15" backup_speed="0.05" time_allowance="10"/>
+          <ComputePathToPose
+            goal="{goal}"
+            path="{path}"
+            planner_id="GridBased"/>
+        </Sequence>
+
+        <!-- Tier 5: last resort — clear local + global, back up, spin,
+             wait for costmap/TF to settle (RPi4B lag), then final replan. -->
+        <Sequence name="FullResetAndReplan">
+          <ClearEntireCostmap
+            name="ClearLocalCostmap_T5"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+          <ClearEntireCostmap
+            name="ClearGlobalCostmap_T5"
+            service_name="global_costmap/clear_entirely_global_costmap"/>
+          <BackUp backup_dist="0.20" backup_speed="0.05" time_allowance="10"/>
+          <Spin spin_dist="1.0" time_allowance="10"/>
+          <Wait wait_duration="1.0"/>
+          <ComputePathToPose
+            goal="{goal}"
+            path="{path}"
+            planner_id="GridBased"/>
+        </Sequence>
+
+      </Fallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
