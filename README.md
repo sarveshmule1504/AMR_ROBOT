@@ -51,3 +51,6 @@ This command tells ROS to capture the current map from memory and save it. It wi
 - `room.yaml` (the configuration/metadata)
 
 Once the map is saved, you can safely press `Ctrl+C` in all the other terminals to shut the robot down.
+<p align="center">
+<img width="1200" height="950" alt="WhatsApp Image 2026-10-15 at 12 06 56 AM (1)" src="https://github.com/user-attachments/assets/892b1f28-f78b-4a4b-a4f6-fa5b762dcec5" />
+
